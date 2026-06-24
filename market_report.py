@@ -1,304 +1,333 @@
 # -*- coding: utf-8 -*-
 """
-텔레그램 아침 매매 브리핑 - 강화판
-- 해외지수/환율/유가
-- 엔비디아·마이크론 등 반도체 5종목
-- 미국 주요 관심종목 급등 2개 / 급락 2개
-- 장전 핵심 뉴스 8개 + 한 줄 매매 해석
-- 오늘 한국장 관심 섹터
+FINAL_V2_NO_NA - 실전형 텔레그램 아침 매매 브리핑
+
+핵심 원칙
+1) N/A 투성이 보고서는 보내지 않는다.
+2) yfinance 제거. Yahoo 직접 API + ETF 대체 + Stooq 백업 사용.
+3) 데이터가 부족하면 분석 보고서 대신 실패 알림만 보낸다.
+4) OPENAI_API_KEY가 있으면 AI 분석, 실패하면 규칙 기반 보고서.
+
+GitHub Secrets:
+- TELEGRAM_BOT_TOKEN
+- TELEGRAM_CHAT_ID
+- OPENAI_API_KEY
 """
 
-import os, re, math, html, datetime as dt
-from urllib.parse import quote_plus
-import requests, feedparser, yfinance as yf
+import os, re, csv, io, json, time, math, datetime as dt
+from urllib.parse import quote, quote_plus
+import requests
+import feedparser
 
 KST = dt.timezone(dt.timedelta(hours=9))
+VERSION = "FINAL_V2_NO_NA"
+HEADERS = {"User-Agent":"Mozilla/5.0 Chrome/126 Safari/537.36", "Accept-Language":"ko-KR,ko;q=0.9,en;q=0.8"}
+TIMEOUT = 15
+MIN_MARKET_OK = 8
+MIN_SEMI_OK = 7
 
-MARKET_ITEMS = [
-    ("S&P500", ["^GSPC", "SPY"], "idx"),
-    ("나스닥", ["^IXIC", "QQQ"], "idx"),
-    ("다우", ["^DJI", "DIA"], "idx"),
-    ("러셀2000", ["^RUT", "IWM"], "idx"),
-    ("필라델피아반도체/SOX", ["^SOX", "SOXX", "SMH"], "idx"),
-    ("VIX 공포지수", ["^VIX"], "idx"),
-    ("미국10년물 금리", ["^TNX"], "yield"),
-    ("달러인덱스", ["DX-Y.NYB", "UUP"], "idx"),
-    ("달러/원", ["KRW=X"], "fx"),
-    ("WTI유가", ["CL=F", "USO"], "cmd"),
-    ("금", ["GC=F", "GLD"], "cmd"),
-    ("한국ETF(EWY)", ["EWY"], "etf"),
+MARKET = [
+    ("sp500","S&P500",["^GSPC","SPY"],["spy.us"],True,"미국 대형주"),
+    ("nasdaq","나스닥",["^IXIC","QQQ"],["qqq.us"],True,"기술주/성장주"),
+    ("dow","다우",["^DJI","DIA"],["dia.us"],False,"경기민감주"),
+    ("russell","러셀2000",["^RUT","IWM"],["iwm.us"],False,"중소형 위험선호"),
+    ("semi","반도체지표(SOX/SMH)",["^SOX","SOXX","SMH"],["soxx.us","smh.us"],True,"한국 반도체 선행"),
+    ("vix","VIX",["^VIX","VIXY"],["vixy.us"],False,"공포지수"),
+    ("tnx","미국10년물금리",["^TNX"],[],False,"금리"),
+    ("dxy","달러인덱스",["DX-Y.NYB","UUP"],["uup.us"],False,"달러 강약"),
+    ("usdkrw","달러/원",["KRW=X"],[],False,"외국인 수급"),
+    ("oil","WTI유가",["CL=F","USO"],["uso.us"],False,"유가"),
+    ("gold","금",["GC=F","GLD"],["gld.us"],False,"안전자산"),
+    ("ewy","한국ETF(EWY)",["EWY"],["ewy.us"],False,"한국 선반영"),
 ]
-
-SEMI5 = [
-    ("NVDA", "엔비디아", "AI GPU/HBM"),
-    ("MU", "마이크론", "메모리/HBM"),
-    ("AMD", "AMD", "AI칩/CPU"),
-    ("AVGO", "브로드컴", "AI 네트워크"),
-    ("ARM", "ARM", "반도체 설계"),
-]
-
+SEMI = [
+    ("NVDA","엔비디아","AI GPU/HBM"),("MU","마이크론","메모리/HBM"),("AMD","AMD","AI칩"),
+    ("AVGO","브로드컴","AI 네트워크"),("ARM","ARM","반도체 설계"),("TSM","TSMC","파운드리"),
+    ("ASML","ASML","EUV 장비"),("AMAT","AMAT","반도체 장비"),("LRCX","램리서치","반도체 장비"),("KLAC","KLA","검사장비")]
 WATCH = {
-    "NVDA": ("엔비디아", "AI/반도체"), "MU": ("마이크론", "메모리/HBM"),
-    "AMD": ("AMD", "AI/반도체"), "AVGO": ("브로드컴", "AI/반도체"),
-    "ARM": ("ARM", "반도체 설계"), "TSM": ("TSMC", "파운드리"),
-    "ASML": ("ASML", "반도체 장비"), "AMAT": ("AMAT", "반도체 장비"),
-    "LRCX": ("램리서치", "반도체 장비"), "KLAC": ("KLA", "반도체 장비"),
-    "QCOM": ("퀄컴", "모바일 반도체"), "INTC": ("인텔", "반도체"),
-    "AAPL": ("애플", "빅테크"), "MSFT": ("마이크로소프트", "AI/클라우드"),
-    "GOOGL": ("알파벳", "AI/광고"), "AMZN": ("아마존", "클라우드/소비"),
-    "META": ("메타", "AI/광고"), "TSLA": ("테슬라", "전기차/로봇"),
-    "NFLX": ("넷플릭스", "미디어"), "LLY": ("일라이릴리", "바이오/비만"),
-    "NVO": ("노보노디스크", "바이오/비만"), "MRNA": ("모더나", "바이오"),
-    "XOM": ("엑슨모빌", "정유/에너지"), "CVX": ("셰브론", "정유/에너지"),
-    "CCJ": ("카메코", "우라늄/원전"), "CEG": ("컨스텔레이션", "원전/전력"),
-    "VST": ("비스트라", "전력/AI전력"), "GEV": ("GE버노바", "전력/가스터빈"),
-    "ALB": ("앨버말", "리튬/2차전지"), "RIVN": ("리비안", "전기차"),
-    "LMT": ("록히드마틴", "방산"), "RTX": ("RTX", "방산/항공"),
-    "BA": ("보잉", "항공"), "JPM": ("JP모건", "금융"),
-    "BAC": ("뱅크오브아메리카", "금융"), "WMT": ("월마트", "소비"),
-    "COST": ("코스트코", "소비"),
-}
+    "NVDA":("엔비디아","AI/반도체"),"MU":("마이크론","메모리/HBM"),"AMD":("AMD","AI/반도체"),
+    "AVGO":("브로드컴","AI/반도체"),"ARM":("ARM","반도체설계"),"TSM":("TSMC","파운드리"),
+    "ASML":("ASML","반도체장비"),"AMAT":("AMAT","반도체장비"),"LRCX":("램리서치","반도체장비"),"KLAC":("KLA","검사장비"),
+    "MSFT":("마이크로소프트","AI/클라우드"),"GOOGL":("알파벳","AI/광고"),"AMZN":("아마존","클라우드/소비"),"META":("메타","AI/광고"),"AAPL":("애플","스마트폰"),"TSLA":("테슬라","전기차/로봇"),
+    "VST":("비스트라","AI전력"),"CEG":("컨스텔레이션","원전/전력"),"GEV":("GE버노바","전력"),"CCJ":("카메코","우라늄/원전"),"ETN":("이튼","전력기기"),"PWR":("콴타서비스","전력망"),
+    "XOM":("엑슨모빌","정유"),"CVX":("셰브론","정유"),"ALB":("앨버말","리튬"),"LLY":("일라이릴리","비만/바이오"),"NVO":("노보노디스크","비만/바이오"),"LMT":("록히드마틴","방산"),"RTX":("RTX","방산/항공")}
+NEWS_Q = [
+    ("미국증시","Nasdaq S&P 500 Nvidia Micron Treasury yields oil dollar market today"),
+    ("반도체AI","Nvidia Micron AMD Broadcom ARM semiconductor AI HBM chips today"),
+    ("금리환율","Federal Reserve Treasury yields dollar inflation CPI PCE jobs market"),
+    ("원자재","WTI crude oil gold copper commodities stock market impact"),
+    ("한국장","Korea stock market outlook Samsung Electronics SK Hynix semiconductor today"),
+    ("전력원전","AI data center power nuclear uranium electricity stocks"),
+    ("정책규제","US China export controls tariffs semiconductor Korea market"),]
+KEYWORDS = "nasdaq s&p yield treasury fed fomc powell cpi pce jobs inflation dollar won oil wti nvidia micron amd broadcom arm tsmc asml semiconductor ai hbm chip earnings guidance tariff export china 데이터센터 금리 환율 달러 유가 원유 엔비디아 마이크론 반도체 삼성전자 하이닉스 실적 관세 수출규제 전력 원전 우라늄".split()
+BAD = "포토 영상 광고 홍보 모집 무료 이벤트 연예 스포츠".split()
 
-NEWS_QUERIES = [
-    ("미국증시", "뉴욕증시 나스닥 S&P500 엔비디아 마이크론 반도체 when:1d"),
-    ("반도체/AI", "엔비디아 마이크론 HBM AI 반도체 삼성전자 SK하이닉스 when:1d"),
-    ("금리/환율", "미국 국채금리 달러 원 환율 FOMC 파월 CPI PCE 고용 when:1d"),
-    ("원자재/유가", "WTI 유가 원유 금 구리 원자재 한국 증시 영향 when:1d"),
-    ("한국장전", "오늘 증시 전망 코스피 코스닥 외국인 기관 수급 when:1d"),
-    ("국내테마", "장전 특징주 급등주 테마주 반도체 바이오 2차전지 로봇 원전 조선 when:1d"),
-    ("정책/수출규제", "미국 관세 수출규제 중국 한국 반도체 배터리 증시 영향 when:1d"),
-    ("기업실적", "미국 기업 실적 가이던스 AI 반도체 한국 증시 영향 when:1d"),
-]
-
-SECTOR_KEYS = {
-    "AI/HBM/반도체": ["엔비디아","nvidia","마이크론","micron","hbm","반도체","ai","tsmc","브로드컴","amd"],
-    "반도체 장비": ["euv","asml","장비","소부장","램리서치","kla","amat"],
-    "2차전지/리튬": ["2차전지","배터리","리튬","전기차","테슬라","앨버말","리비안"],
-    "원전/전력/ESS": ["원전","전력","전력망","ess","우라늄","카메코","ai 전력"],
-    "조선/방산": ["조선","방산","군사","전쟁","수주","lng","록히드","rtx"],
-    "바이오/제약": ["바이오","제약","비만","일라이릴리","노보","fda","임상"],
-    "로봇/자동화": ["로봇","자동화","휴머노이드"],
-    "금융/증권": ["금리","은행","증권","보험","배당"],
-    "정유/화학": ["유가","원유","정유","화학","wti"],
-    "환율수혜/수출": ["환율","달러","수출","원화"],
-}
-
+def now(): return dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M")
 def sf(x):
     try:
-        x = float(x)
+        x=float(x)
         return None if math.isnan(x) or math.isinf(x) else x
-    except Exception:
-        return None
+    except Exception: return None
+def pct(p): return "확인불가" if p is None else f"{p:+.2f}%"
+def price(x): return "확인불가" if x is None else (f"{x:,.2f}" if abs(x)>=1000 else f"{x:.2f}")
+def clean(s,n=170):
+    s=re.sub(r"<.*?>"," ",str(s or "")); s=s.replace("&amp;","&").replace("&quot;",'"')
+    s=re.sub(r"\s+"," ",s).strip()
+    return s[:n-1]+"…" if len(s)>n else s
 
-def pct_txt(x):
-    if x is None: return "N/A"
-    return ("+" if x >= 0 else "") + f"{x:.2f}%"
-
-def esc(x):
-    return html.escape(str(x))
-
-def clean(s, n=145):
-    s = html.unescape(str(s or ""))
-    s = re.sub(r"<.*?>", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:n-1] + "…" if len(s) > n else s
-
-def emoji(p):
-    if p is None: return "⚪"
-    if p >= 2: return "🔥"
-    if p >= 0.5: return "🟢"
-    if p <= -2: return "🔻"
-    if p <= -0.5: return "🔴"
-    return "⚪"
-
-def close_series(ticker):
+def get_json(url):
     try:
-        df = yf.download(ticker, period="7d", interval="1d", progress=False, auto_adjust=False, threads=False)
-        if df is None or df.empty: return None
-        if "Close" in df.columns:
-            c = df["Close"]
-        else:
-            cols = [x for x in df.columns if isinstance(x, tuple) and x[0] == "Close"]
-            if not cols: return None
-            c = df[cols[0]]
-        c = c.dropna()
-        return c if len(c) >= 2 else None
-    except Exception:
-        return None
+        r=requests.get(url,headers=HEADERS,timeout=TIMEOUT)
+        return r.json() if r.status_code==200 else None
+    except Exception: return None
 
-def ticker_change(ticker):
-    c = close_series(ticker)
-    if c is None: return None
-    last, prev = sf(c.iloc[-1]), sf(c.iloc[-2])
-    if last is None or prev in [None, 0]: return None
-    return {"ticker": ticker, "last": last, "pct": (last-prev)/prev*100}
+def get_text(url):
+    try:
+        r=requests.get(url,headers=HEADERS,timeout=TIMEOUT)
+        return r.text if r.status_code==200 else None
+    except Exception: return None
 
-def fallback(tickers):
-    for i, t in enumerate(tickers):
-        r = ticker_change(t)
-        if r:
-            r["proxy"] = i > 0
-            return r
-    return None
-
-def market_rows():
-    rows = []
-    for name, tickers, typ in MARKET_ITEMS:
-        r = fallback(tickers)
-        if not r:
-            rows.append({"name": name, "ticker": tickers[0], "last": "N/A", "pct": None, "note": ""})
-            continue
-        last = r["last"]
-        if typ == "fx": last_txt = f"{last:,.2f}원"
-        elif typ == "yield":
-            y = last/10 if last > 20 else last
-            last_txt = f"{y:.2f}%"
-        else:
-            last_txt = f"{last:,.2f}"
-        rows.append({"name": name, "ticker": r["ticker"], "last": last_txt, "pct": r["pct"], "note": "대체지표" if r["proxy"] else ""})
-    return rows
-
-def stock_rows(items):
-    out=[]
-    for t, name, desc in items:
-        r=ticker_change(t)
-        out.append({"ticker":t,"name":name,"desc":desc,"pct":None if not r else r["pct"],"last":"N/A" if not r else f'{r["last"]:,.2f}'})
+def yahoo_batch(symbols):
+    out={}
+    sy=list(symbols)
+    for i in range(0,len(sy),40):
+        url="https://query1.finance.yahoo.com/v7/finance/quote?symbols="+quote(",".join(sy[i:i+40]))
+        data=get_json(url)
+        for it in (data or {}).get("quoteResponse",{}).get("result",[]):
+            sym=it.get("symbol"); pr=sf(it.get("regularMarketPrice")); pc=sf(it.get("regularMarketChangePercent")); prev=sf(it.get("regularMarketPreviousClose"))
+            if sym and pr is not None and pc is not None: out[sym]={"symbol":sym,"price":pr,"pct":pc,"prev":prev,"src":"YahooQuote"}
     return out
 
-def movers():
+def yahoo_chart(sym):
+    data=get_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(sym,safe='')}?range=10d&interval=1d")
+    try:
+        res=data["chart"]["result"][0]; closes=res["indicators"]["quote"][0].get("close",[])
+        vals=[sf(c) for c in closes]; vals=[v for v in vals if v is not None]
+        if len(vals)<2 or vals[-2]==0: return None
+        return {"symbol":sym,"price":vals[-1],"pct":(vals[-1]-vals[-2])/vals[-2]*100,"prev":vals[-2],"src":"YahooChart"}
+    except Exception: return None
+
+def stooq(sym):
+    txt=get_text(f"https://stooq.com/q/d/l/?s={quote(sym)}&i=d")
+    if not txt: return None
+    try:
+        rows=list(csv.DictReader(io.StringIO(txt))); vals=[sf(r.get("Close")) for r in rows]; vals=[v for v in vals if v is not None]
+        if len(vals)<2 or vals[-2]==0: return None
+        return {"symbol":sym,"price":vals[-1],"pct":(vals[-1]-vals[-2])/vals[-2]*100,"prev":vals[-2],"src":"Stooq"}
+    except Exception: return None
+
+def stooq_us(sym):
+    if sym.startswith("^") or "=" in sym or "-" in sym: return None
+    return stooq(sym.lower()+".us")
+
+def get_price(symbols, stooqs, cache):
+    for i,s in enumerate(symbols):
+        if s in cache:
+            d=dict(cache[s]); d["used"]=s; d["proxy"]=i>0; return d
+    for i,s in enumerate(symbols):
+        d=yahoo_chart(s)
+        if d: d["used"]=s; d["proxy"]=i>0; return d
+    for ss in stooqs:
+        d=stooq(ss)
+        if d: d["used"]=ss; d["proxy"]=True; return d
+    for s in symbols:
+        d=stooq_us(s)
+        if d: d["used"]=d["symbol"]; d["proxy"]=True; return d
+    return None
+
+def collect_prices():
+    sy=set()
+    for _,_,ticks,_,_,_ in MARKET: sy.update(ticks)
+    sy.update([t for t,_,_ in SEMI]); sy.update(WATCH.keys())
+    cache=yahoo_batch(sy)
+    market=[]; semi=[]; errors=[]
+    for key,name,ticks,stqs,must,note in MARKET:
+        d=get_price(ticks,stqs,cache)
+        if d: market.append({"key":key,"name":name,"symbol":d["used"],"price":d["price"],"pct":d["pct"],"src":d["src"],"proxy":d.get("proxy",False),"note":note,"ok":True})
+        else:
+            errors.append(name+" 수집 실패"); market.append({"key":key,"name":name,"symbol":"/".join(ticks),"price":None,"pct":None,"src":"FAIL","proxy":False,"note":note,"ok":False})
+    for t,n,desc in SEMI:
+        d=get_price([t],[],cache)
+        if d: semi.append({"ticker":t,"name":n,"desc":desc,"price":d["price"],"pct":d["pct"],"src":d["src"],"ok":True})
+        else: errors.append(f"{n}({t}) 수집 실패"); semi.append({"ticker":t,"name":n,"desc":desc,"price":None,"pct":None,"src":"FAIL","ok":False})
+    watch=[]
+    for t,(n,sec) in WATCH.items():
+        d=get_price([t],[],cache)
+        if d: watch.append({"ticker":t,"name":n,"sector":sec,"price":d["price"],"pct":d["pct"],"src":d["src"],"ok":True})
+    up=sorted(watch,key=lambda x:x["pct"],reverse=True)[:3]
+    down=sorted(watch,key=lambda x:x["pct"])[:3]
+    val={"market_ok":sum(x["ok"] for x in market),"market_total":len(market),"semi_ok":sum(x["ok"] for x in semi),"semi_total":len(semi),"errors":errors[:20]}
+    val["total_ok"]=val["market_ok"]+val["semi_ok"]; val["total"]=len(market)+len(semi); val["ratio"]=val["total_ok"]/val["total"]
+    val["pass"]=val["market_ok"]>=MIN_MARKET_OK and val["semi_ok"]>=MIN_SEMI_OK
+    return market,semi,up,down,val
+
+def news_score(title,cat):
+    t=title.lower(); sc=2 if cat in ("미국증시","반도체AI","금리환율") else 0
+    sc += sum(3 for k in KEYWORDS if k.lower() in t)
+    if any(b.lower() in t for b in BAD): sc-=8
+    if len(title)<18: sc-=4
+    return sc
+
+def collect_news():
     rows=[]
-    for t,(name,sector) in WATCH.items():
-        r=ticker_change(t)
-        if r: rows.append({"ticker":t,"name":name,"sector":sector,"pct":r["pct"]})
-    return sorted(rows,key=lambda x:x["pct"],reverse=True)[:2], sorted(rows,key=lambda x:x["pct"])[:2]
+    for cat,q in NEWS_Q:
+        url="https://news.google.com/rss/search?q="+quote_plus(q)+"&hl=ko&gl=KR&ceid=KR:ko"
+        try: feed=feedparser.parse(url)
+        except Exception: continue
+        for e in feed.entries[:10]:
+            title=clean(e.get("title","")); src=""
+            try: src=clean(e.source.get("title",""),40)
+            except Exception: pass
+            if title:
+                rows.append({"category":cat,"title":title,"source":src,"score":news_score(title,cat)})
+    # Yahoo Finance ticker news
+    url="https://feeds.finance.yahoo.com/rss/2.0/headline?s="+quote_plus("NVDA,MU,AMD,AVGO,ARM,TSM,ASML,SMH,QQQ,SPY")+"&region=US&lang=en-US"
+    try:
+        feed=feedparser.parse(url)
+        for e in feed.entries[:20]:
+            title=clean(e.get("title",""));
+            if title: rows.append({"category":"미국개별주","title":title,"source":"Yahoo Finance","score":news_score(title,"미국개별주")+2})
+    except Exception: pass
+    seen=set(); out=[]
+    for r in sorted(rows,key=lambda x:x["score"],reverse=True):
+        k=re.sub(r"[^가-힣a-zA-Z0-9]","",r["title"]).lower()[:80]
+        if k in seen or r["score"]<4: continue
+        seen.add(k); out.append(r)
+    return out[:10]
 
-def news_rss(query, max_items=5):
-    url="https://news.google.com/rss/search?q="+quote_plus(query)+"&hl=ko&gl=KR&ceid=KR:ko"
-    try: feed=feedparser.parse(url)
-    except Exception: return []
-    res=[]
-    for e in feed.entries[:max_items]:
-        title=clean(e.get("title",""))
-        if not title: continue
-        src=""
+def item(rows,key):
+    return next((r for r in rows if r.get("key")==key),None)
+
+def tone_and_themes(market,semi,up,news):
+    score=0; rs=[]
+    for key,w,thr,plus,minus in [("sp500",1,.3,"S&P500 강세","S&P500 약세"),("nasdaq",2,.3,"나스닥 강세","나스닥 약세"),("semi",3,.5,"반도체지표 강세","반도체지표 약세")]:
+        r=item(market,key); p=r and r["pct"]
+        if p is not None:
+            if p>=thr: score+=w; rs.append(plus+" "+pct(p))
+            elif p<=-thr: score-=w; rs.append(minus+" "+pct(p))
+    v=item(market,"vix")
+    if v and v["pct"] is not None:
+        if v["pct"]<-3: score+=1; rs.append("VIX 하락")
+        elif v["pct"]>3: score-=1; rs.append("VIX 상승")
+    tone = "위험선호 우세: 반도체/AI/HBM 우선" if score>=3 else "중립 이상: 대장테마 선별" if score>=1 else "위험회피: 추격 금지" if score<=-3 else "경계: 대장주 음봉이면 제외" if score<=-1 else "혼조: 거래대금 확인 전 관망"
+    themes={"AI/HBM/반도체":[0,[]],"반도체 장비/소부장":[0,[]],"전력기기/원전/ESS":[0,[]],"2차전지/리튬":[0,[]],"정유/조선/방산":[0,[]],"바이오/제약":[0,[]]}
+    sx=item(market,"semi")
+    if sx and sx["pct"] is not None and sx["pct"]>=.5: themes["AI/HBM/반도체"][0]+=4; themes["AI/HBM/반도체"][1].append("반도체지표 "+pct(sx["pct"])); themes["반도체 장비/소부장"][0]+=2
+    for s in semi:
+        if not s["ok"] or s["pct"] is None: continue
+        if s["ticker"] in "NVDA MU AMD AVGO ARM TSM".split() and s["pct"]>=1:
+            themes["AI/HBM/반도체"][0]+=2; themes["AI/HBM/반도체"][1].append(f"{s['name']} {pct(s['pct'])}")
+        if s["ticker"] in "ASML AMAT LRCX KLAC".split() and s["pct"]>=1:
+            themes["반도체 장비/소부장"][0]+=2; themes["반도체 장비/소부장"][1].append(f"{s['name']} {pct(s['pct'])}")
+    for m in up:
+        sec=m["sector"]
+        if any(x in sec for x in ["전력","원전","우라늄"]): themes["전력기기/원전/ESS"][0]+=3; themes["전력기기/원전/ESS"][1].append(m["name"]+" 강세")
+        if any(x in sec for x in ["리튬","2차전지"]): themes["2차전지/리튬"][0]+=3; themes["2차전지/리튬"][1].append(m["name"]+" 강세")
+        if any(x in sec for x in ["방산","항공"]): themes["정유/조선/방산"][0]+=2; themes["정유/조선/방산"][1].append(m["name"]+" 강세")
+        if "바이오" in sec: themes["바이오/제약"][0]+=2; themes["바이오/제약"][1].append(m["name"]+" 강세")
+    nt=" ".join(n["title"].lower() for n in news)
+    if any(k in nt for k in ["nvidia","micron","semiconductor","hbm","엔비디아","마이크론","반도체"]): themes["AI/HBM/반도체"][0]+=2; themes["AI/HBM/반도체"][1].append("반도체/AI 뉴스")
+    if any(k in nt for k in ["power","nuclear","uranium","전력","원전","우라늄"]): themes["전력기기/원전/ESS"][0]+=2; themes["전력기기/원전/ESS"][1].append("전력/원전 뉴스")
+    ranked=[{"theme":k,"score":v[0],"reasons":list(dict.fromkeys(v[1]))[:4]} for k,v in themes.items() if v[0]>0]
+    ranked.sort(key=lambda x:x["score"],reverse=True)
+    return tone,rs[:6],ranked[:3]
+
+def context(market,semi,up,down,news,val):
+    tone,rs,themes=tone_and_themes(market,semi,up,news)
+    def ok_rows(rows):
+        out=[]
+        for r in rows:
+            if not r.get("ok",True): continue
+            d=dict(r); d["pct_text"]=pct(d.get("pct")); d["price_text"]=price(d.get("price")); out.append(d)
+        return out
+    return {"version":VERSION,"time_kst":now(),"validation":val,"tone":tone,"tone_reasons":rs,"market":ok_rows(market),"semiconductors":ok_rows(semi),"movers_up":ok_rows(up),"movers_down":ok_rows(down),"news":news[:8],"themes":themes,"rules":["음봉 매수 금지","양봉+VWAP 위만 관심","대장테마 거래대금 1~3등주","급등 직후 추격 금지","눌림 후 기준봉 재돌파","양봉 거래량 증가+음봉 거래량 감소는 매집 참고"]}
+
+def openai_report(ctx):
+    key=os.getenv("OPENAI_API_KEY","").strip()
+    if not key: return None,"OPENAI_API_KEY 없음"
+    prompt="""너는 한국 주식 장초반 단기매매 전문 애널리스트다. 아래 JSON 원자료만 사용해 한국어 텔레그램 보고서를 작성하라.
+규칙: 없는 데이터 지어내지 말 것. 뉴스 나열 금지, 한국장 섹터와 매매 판단으로 연결. 매수 추천 단정 금지. 음봉 매수 금지, VWAP 위 양봉, 거래대금 1~3등주, 눌림 재돌파 기준 반영.
+형식:
+📌 AI 실전형 아침 매매 브리핑
+1) 오늘 한 줄 결론
+2) 미국시장 핵심: 의미 있는 수치와 한국장 영향
+3) 반도체 핵심주: 엔비디아·마이크론·AMD·브로드컴·ARM 중심
+4) 급등/급락 미국 관심종목과 한국 연결
+5) 오늘 한국장 관심 테마 TOP 3: 근거/볼 것/매수금지
+6) 뉴스 5~8개: 왜 중요한가/매매 해석
+7) 9시 이후 실행 순서 5줄
+8) 오늘 피해야 할 매매 5줄
+JSON:
+"""+json.dumps(ctx,ensure_ascii=False)
+    headers={"Authorization":"Bearer "+key,"Content-Type":"application/json"}
+    errs=[]
+    for model in [os.getenv("OPENAI_MODEL",""),"gpt-4.1-mini","gpt-4o-mini"]:
+        if not model: continue
         try:
-            if hasattr(e,"source") and e.source: src=clean(e.source.get("title",""),35)
-        except Exception: pass
-        res.append({"title":title,"source":src})
-    return res
+            r=requests.post("https://api.openai.com/v1/responses",headers=headers,json={"model":model,"input":prompt,"temperature":0.2,"max_output_tokens":2200},timeout=45)
+            if r.status_code==200:
+                txt=r.json().get("output_text")
+                if txt and len(txt)>500: return txt.strip(),None
+            errs.append(r.text[:200])
+        except Exception as e: errs.append(str(e))
+    return None,"; ".join(errs)[-500:]
 
-def view(category,title):
-    t=title.lower()
-    if any(k in t for k in ["엔비디아","nvidia","마이크론","micron","hbm","반도체","ai","tsmc","브로드컴","amd"]):
-        return "삼성전자·SK하이닉스·HBM·반도체장비주 장초반 수급 우선 확인."
-    if any(k in t for k in ["금리","fed","fomc","파월","국채","cpi","pce","고용"]):
-        return "금리 상승이면 성장주 추격 자제, 금리 하락이면 기술주 반등 가능성 체크."
-    if any(k in t for k in ["환율","달러","원화"]):
-        return "달러/원 상승은 외국인 수급 부담, 하락은 대형주 수급 개선 가능성."
-    if any(k in t for k in ["유가","wti","원유","정유"]):
-        return "유가 상승은 정유·조선 일부 관심, 항공·화학은 비용 부담 체크."
-    if any(k in t for k in ["전력","원전","ess","우라늄"]):
-        return "AI 전력·원전·전력기기·ESS 테마로 연결되는지 거래대금 확인."
-    if any(k in t for k in ["방산","전쟁","지정학","군사"]):
-        return "지정학 이슈는 방산·조선·에너지 단기 수급 가능성 체크."
-    if any(k in t for k in ["바이오","제약","임상","fda","비만"]):
-        return "바이오는 개별 재료 성격, 대장주와 거래대금 지속 여부가 핵심."
-    if any(k in t for k in ["급등","특징주","상한가","테마"]):
-        return "대장테마 안에서 거래대금 1~3위, 양봉·VWAP 위 종목만 선별."
-    return "뉴스만 보고 매수하지 말고 거래대금·양봉·VWAP 위 여부 확인."
+def fallback(ctx,err=None):
+    L=["📌 AI 실전형 아침 매매 브리핑",f"기준: {ctx['time_kst']} KST",f"데이터 정상: {ctx['validation']['total_ok']}/{ctx['validation']['total']}"]
+    if err: L.append("※ AI 실패, 규칙 기반 보고서: "+err[:120])
+    L += ["","1) 오늘 한 줄 결론","- "+ctx["tone"],"- 근거: "+(", ".join(ctx["tone_reasons"]) or "혼조")]
+    L += ["","2) 밤사이 미국시장 핵심"]
+    for r in ctx["market"][:12]: L.append(f"- {r['name']}: {r['pct_text']} ({r.get('symbol','')}/{r.get('src','')}) → {r.get('note','')}")
+    L += ["","3) 반도체 핵심주"]
+    for r in ctx["semiconductors"][:10]: L.append(f"- {r['name']}({r['ticker']}): {r['pct_text']} → {r.get('desc','')}")
+    L.append("→ 한국 연결: 삼성전자·SK하이닉스·HBM·장비/소부장. 장초반 대장주 음봉이면 제외.")
+    L += ["","4) 미국 관심종목 급등/급락","급등:"]
+    for r in ctx["movers_up"]: L.append(f"- {r['name']}({r['ticker']}): {r['pct_text']} / {r['sector']}")
+    L.append("급락:")
+    for r in ctx["movers_down"]: L.append(f"- {r['name']}({r['ticker']}): {r['pct_text']} / {r['sector']}")
+    L += ["","5) 오늘 한국장 관심 테마 TOP 3"]
+    if ctx["themes"]:
+        for i,t in enumerate(ctx["themes"],1):
+            L.append(f"{i}. {t['theme']} / 점수 {t['score']} / 근거: {', '.join(t['reasons']) or '미국시장 연동'}")
+            L.append("   볼 것: 거래대금 1~3등주, 양봉+VWAP 위, 눌림 후 기준봉 재돌파")
+            L.append("   금지: 갭상승 후 음봉, 윗꼬리, 시가 이탈, 거래대금 약화")
+    else: L.append("- 뚜렷한 우위 테마 없음. 장초반 거래대금 확인 전 관망.")
+    L += ["","6) 뉴스 핵심"]
+    for i,n in enumerate(ctx["news"][:8],1): L.append(f"{i}. [{n['category']}] {n['title']} / {n.get('source','')}")
+    L += ["","7) 9시 이후 실행 순서","1. 지수보다 거래대금 상위 테마 확인","2. 테마 안 대장주 1~3등만 남김","3. 음봉 매수 금지, VWAP 위 양봉만 관찰","4. 급등 직후 추격 금지, 눌림 후 재돌파만 관심","5. 손절선 불명확하면 매수하지 않음","","8) 오늘 피해야 할 매매","- 뉴스만 보고 매수","- 갭상승 후 음봉 전환","- 윗꼬리 긴 종목","- 대장주 약한데 2~3등주 추격","- 손절 기준 없는 매매",f"\n버전: {VERSION}"]
+    return "\n".join(L)
 
-def news_blocks(n=8):
-    out=[]; seen=set()
-    for cat,q in NEWS_QUERIES:
-        for it in news_rss(q,4):
-            key=re.sub(r"[^가-힣a-z0-9]","",it["title"].lower())[:60]
-            if key in seen: continue
-            seen.add(key)
-            out.append({"cat":cat,"title":it["title"],"source":it["source"],"view":view(cat,it["title"])})
-            break
-        if len(out)>=n: break
-    return out[:n]
+def fail_msg(val,market,semi):
+    L=["⚠️ 아침 매매 브리핑 중단",f"기준: {now()} KST","","N/A 보고서를 보내지 않기 위해 분석을 중단했습니다.",f"시장 데이터 성공: {val['market_ok']}/{val['market_total']}",f"반도체 데이터 성공: {val['semi_ok']}/{val['semi_total']}",f"전체 성공률: {val['ratio']:.0%}","","성공한 데이터:"]
+    for x in [*market,*semi]:
+        if x.get("ok"): L.append(f"- {x.get('name')} {x.get('ticker','')}: {pct(x.get('pct'))} ({x.get('symbol',x.get('ticker',''))}/{x.get('src')})")
+    L += ["","대표 실패:"] + ["- "+e for e in val.get("errors",[])[:8]]
+    L.append("\n조치: 데이터 원천 문제입니다. 허접한 N/A 보고서보다 이 알림이 안전합니다.")
+    return "\n".join(L)
 
-def sectors(news, markets, semis, up, down):
-    score={k:0 for k in SECTOR_KEYS}
-    text=" ".join([x["title"] for x in news] + [f'{x["name"]} {pct_txt(x["pct"])} {x["desc"]}' for x in semis] + [f'{x["name"]} {x["sector"]}' for x in up+down]).lower()
-    for sec, keys in SECTOR_KEYS.items():
-        for k in keys:
-            if k.lower() in text: score[sec]+=1
-    for m in markets:
-        if "필라델피아" in m["name"] and m["pct"] is not None and m["pct"] > 0.5:
-            score["AI/HBM/반도체"] += 2; score["반도체 장비"] += 1
-        if m["name"] == "WTI유가" and m["pct"] is not None and m["pct"] > 1:
-            score["정유/화학"] += 2
-        if m["name"] == "달러/원" and m["pct"] is not None and m["pct"] > 0.3:
-            score["환율수혜/수출"] += 1
-    return [(k,v) for k,v in sorted(score.items(), key=lambda x:x[1], reverse=True) if v>0][:5]
-
-def tone(markets):
-    d={x["name"]:x["pct"] for x in markets}
-    arr=[]
-    nas=d.get("나스닥"); sox=d.get("필라델피아반도체/SOX"); vix=d.get("VIX 공포지수"); krw=d.get("달러/원")
-    if nas is not None: arr.append("나스닥 강세 → 성장주 우호" if nas>0.5 else "나스닥 약세 → 성장주 추격 주의" if nas<-0.5 else "나스닥 보합 → 개별 테마 장세")
-    if sox is not None: arr.append("반도체 강세 → HBM/장비 우선" if sox>0.7 else "반도체 약세 → 반도체 추격 금지" if sox<-0.7 else "반도체 보합 → 종목 선별")
-    if vix is not None and vix>5: arr.append("VIX 상승 → 변동성 주의")
-    if krw is not None and krw>0.3: arr.append("환율 상승 → 외국인 수급 부담")
-    return " / ".join(arr) if arr else "시장 방향성 판단 데이터 부족"
-
-def make_report():
-    m=market_rows(); s=stock_rows(SEMI5); up,down=movers(); n=news_blocks(8); sec=sectors(n,m,s,up,down)
-    lines=[]
-    lines += ["📌 <b>아침 매매 브리핑 - 강화판</b>", f"기준: {dt.datetime.now(KST).strftime('%Y-%m-%d %H:%M')} KST", "", "🧭 <b>오늘 한 줄 결론</b>", esc(tone(m)), ""]
-    lines.append("✅ <b>1) 해외시장 핵심 수치</b>")
-    for x in m:
-        note=f" / {x['note']}" if x['note'] else ""
-        lines.append(f"{emoji(x['pct'])} {esc(x['name'])}: {esc(x['last'])} / {esc(pct_txt(x['pct']))} ({esc(x['ticker'])}{esc(note)})")
-    lines += ["", "🧠 <b>2) 밤사이 반도체 핵심 5종목</b>"]
-    for x in s:
-        lines.append(f"{emoji(x['pct'])} {esc(x['name'])}({esc(x['ticker'])}): {esc(pct_txt(x['pct']))} / {esc(x['desc'])}")
-    lines.append("→ 한국 연결: 삼성전자·SK하이닉스·HBM·반도체장비·소부장")
-    lines += ["", "🚀 <b>3) 미국 관심종목 급등/급락</b>", "<b>급등 2종목</b>"]
-    for x in up: lines.append(f"🔥 {esc(x['name'])}({esc(x['ticker'])}): {esc(pct_txt(x['pct']))} / 섹터: {esc(x['sector'])}")
-    lines.append("<b>급락 2종목</b>")
-    for x in down: lines.append(f"🔻 {esc(x['name'])}({esc(x['ticker'])}): {esc(pct_txt(x['pct']))} / 섹터: {esc(x['sector'])}")
-    lines += ["", "📰 <b>4) 장전 핵심 뉴스 8개 + 한 줄 매매 해석</b>"]
-    for i,x in enumerate(n,1):
-        lines += ["", f"{i}. <b>[{esc(x['cat'])}]</b> {esc(x['title'])}"]
-        if x['source']: lines.append(f"   출처: {esc(x['source'])}")
-        lines.append(f"   → {esc(x['view'])}")
-    lines += ["", "🎯 <b>5) 오늘 한국장 관심 섹터 후보</b>"]
-    if sec:
-        for i,(name,score) in enumerate(sec,1): lines.append(f"{i}. {esc(name)} / 점수: {score} / 장초반 거래대금 확인")
-    else: lines.append("뚜렷한 섹터 점수 없음 → 장초반 거래대금 상위 테마 확인")
-    lines += ["", "📍 <b>6) 형의 장초반 매매 체크리스트</b>", "1. 거래대금 상위 테마부터 본다.", "2. 대장테마 안에서도 1~3등주만 본다.", "3. 음봉 매수 금지. 양봉 + VWAP 위 종목만 본다.", "4. 전일 동시간 대비 거래량 2~3배 이상인지 확인한다.", "5. 급등 직후 추격 금지. 눌림 후 기준봉 고가 재돌파만 본다.", "6. 음봉 거래량 감소 + 양봉 거래량 증가면 매집 가능성 가산점.", "7. 손절 기준이 애매한 종목은 매수하지 않는다.", "", "⚠️ 자동 수집 자료입니다. 실제 매수 전 현재가·거래량·뉴스 원문을 반드시 확인하세요."]
-    return "\n".join(lines)
-
-def split_msg(msg, max_len=3600):
+def send(msg):
+    token=os.getenv("TELEGRAM_BOT_TOKEN","").strip(); chat=os.getenv("TELEGRAM_CHAT_ID","").strip()
+    if not token or not chat: raise RuntimeError("TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 없음")
     parts=[]; cur=[]
     for line in msg.splitlines():
-        test="\n".join(cur+[line])
-        if len(test)>max_len and cur:
-            parts.append("\n".join(cur)); cur=[line]
+        if len("\n".join(cur+[line]))>3600 and cur: parts.append("\n".join(cur)); cur=[line]
         else: cur.append(line)
     if cur: parts.append("\n".join(cur))
-    return parts
-
-def send_telegram(msg):
-    token=os.getenv("TELEGRAM_BOT_TOKEN","").strip(); chat_id=os.getenv("TELEGRAM_CHAT_ID","").strip()
-    if not token: raise RuntimeError("TELEGRAM_BOT_TOKEN 환경변수가 없습니다.")
-    if not chat_id: raise RuntimeError("TELEGRAM_CHAT_ID 환경변수가 없습니다.")
     url=f"https://api.telegram.org/bot{token}/sendMessage"
-    parts=split_msg(msg)
     for i,p in enumerate(parts,1):
-        head=f"({i}/{len(parts)})\n" if len(parts)>1 else ""
-        r=requests.post(url,json={"chat_id":chat_id,"text":head+p,"parse_mode":"HTML","disable_web_page_preview":True},timeout=30)
-        if r.status_code!=200: raise RuntimeError(f"텔레그램 발송 실패: {r.status_code} / {r.text}")
-    return True
+        text=(f"({i}/{len(parts)})\n" if len(parts)>1 else "")+p
+        r=requests.post(url,json={"chat_id":chat,"text":text,"disable_web_page_preview":True},timeout=30)
+        if r.status_code!=200: raise RuntimeError(f"텔레그램 실패 {r.status_code}: {r.text}")
 
 def main():
-    msg=make_report()
-    print(msg.replace("<b>","").replace("</b>","")[:5000])
-    send_telegram(msg)
-    print("Telegram send success")
+    print("VERSION",VERSION)
+    market,semi,up,down,val=collect_prices(); news=collect_news()
+    print(json.dumps(val,ensure_ascii=False,indent=2)); print("NEWS",len(news))
+    if not val["pass"]:
+        msg=fail_msg(val,market,semi); print(msg); send(msg); return
+    ctx=context(market,semi,up,down,news,val)
+    txt,err=openai_report(ctx)
+    msg=(txt+f"\n\n데이터 정상: {val['total_ok']}/{val['total']} / 버전: {VERSION}") if txt else fallback(ctx,err)
+    print(msg[:5000]); send(msg)
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
