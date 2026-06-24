@@ -1,4 +1,2 @@
-requests
-feedparser
-yfinance
-openai
+requests==2.32.3
+feedparser==6.0.11
